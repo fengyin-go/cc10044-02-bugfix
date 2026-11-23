@@ -17,8 +17,18 @@ class TransformPlanService(BaseModuleService):
     LIST_FIELDS = ["方案名称", "步骤序列", "输入表", "输出表", "依赖关系"]
     REQUIRED_FIELDS = ["方案名称", "步骤序列", "输入表"]
     STATUS_ORDER = ["草稿", "已发布", "已停用"]
-    ACTION_RULES = {"发布方案": "已发布", "停用方案": "已停用"}
+    ACTION_RULES = {"发布方案": "已发布", "停用方案": "已停用", "登记血缘": "已发布"}
     NEGATIVE_ACTIONS = ["停用方案"]
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        # 登记血缘不改变方案状态，只做幂等登记后回显当前方案。
+        if action == "登记血缘":
+            result = self.register_lineage_from_plan(entry_id)
+            if not result.get("ok"):
+                return None, result["message"]
+            entry = store.find(self.MODULE, entry_id)
+            return entry, result["message"]
+        return super().run_action(entry_id, action)
 
     def resolve_step_dependencies(self, entry_id: int) -> dict[str, Any]:
         """解析转换步骤之间的依赖关系。
@@ -56,6 +66,51 @@ class TransformPlanService(BaseModuleService):
             "can_parallelize": len(parallel_groups) < len(steps),
         }
 
+    def plan_steps(self, entry_id: int) -> list[dict[str, Any]]:
+        """返回方案的步骤模型（含步骤编号、输入输出表和依赖），供跨模块取数复用。"""
+        deps = self.resolve_step_dependencies(entry_id)
+        return deps.get("steps", [])
+
+    def plan_lineage_rows(self, plan_id: int) -> list[dict[str, Any]]:
+        """返回某一版方案已登记的全部血缘行（按血缘编号排序）。"""
+        rows = [
+            row for row in store.rows("lineage_graph")
+            if str(row.get("转换方案ID", "")) == str(plan_id)
+        ]
+        rows.sort(key=lambda row: int(row.get("id", 0)))
+        return rows
+
+    def plan_lineage_ids(self, plan_id: int) -> list[int]:
+        return [int(row["id"]) for row in self.plan_lineage_rows(plan_id)]
+
+    def is_lineage_complete(self, plan_id: int) -> bool:
+        """判断方案血缘是否登记齐全：方案已发布且每个步骤的输入→输出都有对应血缘。"""
+        entry = store.find(self.MODULE, plan_id)
+        if entry is None or entry.get("status") != "已发布":
+            return False
+        steps = self.plan_steps(plan_id)
+        if not steps:
+            return False
+        active_rows = [
+            row for row in self.plan_lineage_rows(plan_id)
+            if row.get("status") == "已建立"
+        ]
+        if len(active_rows) < len(steps):
+            return False
+        for step in steps:
+            input_table = step.get("input", "")
+            output_table = step.get("output", "")
+            if not input_table or not output_table:
+                return False
+            matched = any(
+                row.get("目标表") == output_table
+                and input_table in [s.strip() for s in str(row.get("来源表列表", "")).split(",") if s.strip()]
+                for row in active_rows
+            )
+            if not matched:
+                return False
+        return True
+
     def dry_run_transform(self, entry_id: int) -> dict[str, Any]:
         """试运行转换方案。
 
@@ -92,8 +147,8 @@ class TransformPlanService(BaseModuleService):
     def deploy_to_pipeline(self, entry_id: int, pipeline_id: int) -> dict[str, Any]:
         """将转换方案部署到指定的ETL流水线。
 
-        发布方案时自动关联到目标流水线的转换阶段，
-        替换流水线中的默认转换规则。
+        发布方案时关联到目标流水线作为待生效方案，
+        是否真正生效由启动时的血缘完整性校验决定。
         """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
@@ -112,23 +167,37 @@ class TransformPlanService(BaseModuleService):
             "plan_name": entry.get("方案名称"),
             "pipeline_id": pipeline_id,
             "pipeline_name": pipeline_entry.get("流水线名称"),
+            "lineage_complete": self.is_lineage_complete(entry_id),
             "message": f"方案 {entry.get('方案名称')} 已部署到流水线 {pipeline_entry.get('流水线名称')}",
         }
 
     def register_lineage_from_plan(self, entry_id: int) -> dict[str, Any]:
-        """从转换方案自动注册血缘关系。
+        """从转换方案登记血缘关系（幂等）。
 
-        解析方案的每个步骤，为每对输入→输出表创建血缘条目。
+        解析方案的每个步骤，为每对输入→输出表创建带方案版本号的血缘条目。
+        同一版方案重复登记只返回首次写入的同一组血缘编号，不会重复建关系。
         """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return {"ok": False, "message": "转换方案不存在"}
 
+        # 幂等：该方案已有血缘登记时直接回显同一组编号。
+        existing_ids = self.plan_lineage_ids(entry_id)
+        if existing_ids:
+            return {
+                "ok": True,
+                "plan_id": entry_id,
+                "deduplicated": True,
+                "registered_lineages": len(existing_ids),
+                "lineage_ids": existing_ids,
+                "message": f"方案血缘已登记，复用既有 {len(existing_ids)} 条血缘关系",
+            }
+
         deps = self.resolve_step_dependencies(entry_id)
         lineage_rows = store.rows("lineage_graph")
         start_id = max((int(r.get("id", 0)) for r in lineage_rows), default=0) + 1
         new_lineages = []
-        for step in deps["steps"]:
+        for index, step in enumerate(deps["steps"]):
             if step["input"] and step["output"]:
                 lid = start_id + len(new_lineages)
                 lineage_rows.append({
@@ -137,8 +206,10 @@ class TransformPlanService(BaseModuleService):
                     "目标表": step["output"],
                     "来源表列表": step["input"],
                     "转换逻辑": f"transform_plan_{entry_id}_step_{step['id']}",
-                    "中间层级": "1",
-                    "血缘深度": "1",
+                    "中间层级": str(index + 1),
+                    "血缘深度": str(index + 1),
+                    "转换方案ID": str(entry_id),
+                    "转换步骤ID": step["id"],
                     "pending": False,
                     "abnormal": False,
                 })
@@ -147,9 +218,10 @@ class TransformPlanService(BaseModuleService):
         return {
             "ok": True,
             "plan_id": entry_id,
+            "deduplicated": False,
             "registered_lineages": len(new_lineages),
             "lineage_ids": new_lineages,
-            "message": f"已注册 {len(new_lineages)} 条血缘关系",
+            "message": f"已登记 {len(new_lineages)} 条血缘关系",
         }
 
     def _parse_step_sequence(self, sequence_str: str) -> list[dict[str, str]]:
